@@ -1,6 +1,6 @@
-# Stories110M — Full-Scale ANE Training
+# Stories110M — ANE Training + Inference
 
-Training a 109M-parameter Llama2-architecture transformer (Stories110M) on Apple's Neural Engine using private ANE APIs.
+Training and inference for a 109M-parameter Llama2-architecture transformer (Stories110M) on Apple's Neural Engine using private ANE APIs.
 
 ## Model
 
@@ -31,6 +31,7 @@ Per-step timing breakdown on M4:
 | File | Description |
 |------|-------------|
 | `train_large.m` | Main training loop — 12-layer forward/backward, checkpoint, exec() restart |
+| `inference.m` | ANE-accelerated autoregressive inference with KV-cache |
 | `stories_config.h` | Model config, structs, memory allocation helpers |
 | `stories_io.h` | IOSurface I/O, NEON fp16 conversion, kernel compile/eval wrappers |
 | `stories_mil.h` | MIL program generators for all 6 ANE kernel types |
@@ -53,6 +54,8 @@ Per-step timing breakdown on M4:
 
 ## Usage
 
+### Training
+
 ```bash
 # 1. Extract tokenized data (needs ~/tiny_stories_data_pretokenized.zip)
 python3 tokenize.py
@@ -68,6 +71,25 @@ python3 dashboard.py --resume     # spawns train_large, shows TUI
 python3 dashboard.py --infinite   # train indefinitely
 python3 dashboard.py --no-powermetrics  # skip sudo for power monitoring
 ```
+
+### Inference
+
+```bash
+make inference
+./inference                          # ANE-accelerated, 256 tokens
+./inference --tokens 512 --temp 0.6  # longer, less random
+./inference --temp 0                 # greedy decoding
+./inference --top-p 0.95             # nucleus sampling
+./inference --cpu                    # CPU-only (Accelerate BLAS) for comparison
+./inference --ckpt ane_stories110M_ckpt.bin  # use trained checkpoint
+```
+
+The inference engine compiles 49 ANE kernels once at startup (4 per layer + 1 classifier):
+- **Fused QKV**: single ANE dispatch for Q, K, V projections
+- **Fused FFN up**: W1 + W3 + SiLU + gate in one kernel
+- **Wo, W2**: separate projection kernels
+- KV-cache on CPU for O(1) per-token attention
+- CPU handles RMSNorm, RoPE, causal attention, sampling
 
 ### Dashboard Controls
 

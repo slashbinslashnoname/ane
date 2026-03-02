@@ -1,16 +1,22 @@
-# ANE Training — Backpropagation on Apple Neural Engine
+# ANE Training + Inference — Apple Neural Engine
 
-Training neural networks directly on Apple's Neural Engine (ANE) via reverse-engineered private APIs. No CoreML training APIs, no Metal, no GPU — pure ANE compute.
+Training and inference on Apple's Neural Engine (ANE) via reverse-engineered private APIs. No CoreML, no Metal, no GPU — pure ANE compute.
 
 ## Overview
 
-A from-scratch transformer training implementation (forward + backward pass) running entirely on the ANE in Apple Silicon. The ANE is a 15.8 TFLOPS (M4) inference accelerator that Apple does not expose for training. This project reverse-engineers the `_ANEClient` / `_ANECompiler` private APIs and the MIL (Model Intermediate Language) format to run custom compute graphs — including backpropagation — directly on ANE hardware.
+A from-scratch transformer training and inference implementation running on the ANE in Apple Silicon. The ANE is a 15.8 TFLOPS (M4) accelerator that Apple only exposes for CoreML inference. This project reverse-engineers the `_ANEClient` / `_ANECompiler` private APIs and the MIL (Model Intermediate Language) format to run custom compute graphs — including backpropagation and direct inference — on ANE hardware.
 
-**Results on M4 (single transformer layer, dim=768, seq=512):**
+**Training results on M4 (single transformer layer, dim=768, seq=512):**
 - 9.3 ms/step, 11.2% ANE utilization (1.78 TFLOPS sustained)
 - 6 ANE kernel dispatches per training step
 - Forward and backward dx passes on ANE, dW gradients on CPU (Accelerate cblas)
 - Adam optimizer, gradient accumulation, checkpoint/resume
+
+**Inference** — ANE-accelerated autoregressive generation with:
+- Baked-weight ANE kernels compiled once (no recompilation during generation)
+- Fused QKV projection (single ANE dispatch), fused FFN up (W1+W3+SiLU+gate)
+- KV-cache for O(1) per-token attention
+- CPU fallback via Accelerate BLAS for comparison (`--cpu`)
 
 ## Architecture
 
@@ -50,6 +56,7 @@ ane/
 ├── sram_probe.m                # SRAM size/layout exploration
 └── training/
     ├── train_large.m           # Main: 12-layer Stories110M training (optimized)
+    ├── inference.m             # ANE-accelerated inference with KV-cache
     ├── train.m                 # Minimal training loop (early prototype)
     ├── tiny_train.m            # 2-layer tiny model training
     ├── ane_runtime.h           # ANE private API wrapper (compile, eval, IOSurface)
@@ -98,6 +105,23 @@ make train_large
 ./train_large                     # start fresh
 ./train_large --resume            # resume from checkpoint
 ./train_large --resume --steps 50000
+```
+
+### Inference
+
+```bash
+cd training
+
+# Build inference
+make inference
+
+# Generate text with ANE acceleration
+./inference                          # default: 256 tokens, temp=0.8
+./inference --tokens 512 --temp 0.6  # longer, less random
+./inference --temp 0 --tokens 128    # greedy decoding
+./inference --top-p 0.95             # nucleus sampling
+./inference --cpu                    # CPU-only (BLAS) for comparison
+./inference --ckpt ane_stories110M_ckpt.bin  # use trained checkpoint
 ```
 
 ### Dashboard
