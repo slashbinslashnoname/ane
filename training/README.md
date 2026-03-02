@@ -1,17 +1,21 @@
-# ANE Training — Stories110M on Apple Neural Engine
+# Stories110M — Full-Scale ANE Training
 
-Training a 109M-parameter Llama2-architecture transformer (Stories110M) directly on Apple's Neural Engine using private ANE APIs.
+Training a 109M-parameter Llama2-architecture transformer (Stories110M) on Apple's Neural Engine using private ANE APIs.
 
-![Dashboard](dashboard.gif)
+## Model
 
-## Architecture
-
-- **Model**: Stories110M — dim=768, hidden=2048, heads=12, layers=12, vocab=32000, seq=256
-- **109.53M params** (84.95M transformer + 24.58M embedding)
-- **72 ANE kernels** per compile (60 weight-bearing, 12 weight-free sdpaBwd2)
-- **6 kernel types per layer**: fwdAttn, fwdFFN, ffnBwd, sdpaBwd1, sdpaBwd2, qkvBwd
+| Parameter | Value |
+|-----------|-------|
+| Architecture | Llama2 (RMSNorm + SwiGLU + RoPE + GQA) |
+| Dimensions | dim=768, hidden=2048, heads=12, seq=256 |
+| Layers | 12 |
+| Vocabulary | 32,000 (BPE, llama2.c tokenizer) |
+| Parameters | 109.53M (84.95M transformer + 24.58M embedding) |
+| ANE kernels | 72 per compile (60 weight-bearing + 12 weight-free sdpaBwd2) |
 
 ## Performance
+
+Per-step timing breakdown on M4:
 
 | Component | Time (ms/step) |
 |-----------|---------------|
@@ -27,19 +31,21 @@ Training a 109M-parameter Llama2-architecture transformer (Stories110M) directly
 | File | Description |
 |------|-------------|
 | `train_large.m` | Main training loop — 12-layer forward/backward, checkpoint, exec() restart |
-| `stories_config.h` | Model config, structs, alloc helpers |
-| `stories_io.h` | IOSurface I/O, NEON fp16 conversion, kernel compile/eval |
+| `stories_config.h` | Model config, structs, memory allocation helpers |
+| `stories_io.h` | IOSurface I/O, NEON fp16 conversion, kernel compile/eval wrappers |
 | `stories_mil.h` | MIL program generators for all 6 ANE kernel types |
-| `stories_cpu_ops.h` | vDSP-vectorized RMSNorm, cross-entropy, Adam, embedding ops |
-| `dashboard.py` | TUI dashboard — loss curve, power/CPU/memory graphs, text generation |
-| `tokenize.py` | Extract pretokenized TinyStories data |
-| `Makefile` | Build targets |
+| `stories_cpu_ops.h` | vDSP-vectorized RMSNorm, cross-entropy loss, Adam optimizer, embedding ops |
+| `dashboard.py` | TUI dashboard — loss curves, power/CPU/memory graphs, live text generation |
+| `tokenize.py` | Extract pretokenized TinyStories data from zip |
+| `test_dashboard.py` | Python unit tests for dashboard functions (59 tests) |
+| `test_*.m` | ANE kernel tests and hardware probes (10 files) |
+| `Makefile` | Build targets for training and probes |
 
-## How it works
+## Training Pipeline
 
-1. **Forward pass**: Each layer runs fwdAttn (QKV + SDPA + Wo) and fwdFFN (W1 + SiLU(W3) + W2) on ANE via MIL-compiled kernels. Final RMSNorm + classifier matmul on CPU (cblas).
+1. **Forward pass**: Each layer runs `fwdAttn` (QKV + SDPA + Wo) and `fwdFFN` (W1 + SiLU(W3) + W2) on ANE via MIL-compiled kernels. Final RMSNorm + classifier matmul on CPU (cblas).
 
-2. **Backward pass**: Reverse layer order. ffnBwd, sdpaBwd1, sdpaBwd2, qkvBwd on ANE. Weight gradients (dW) via async cblas_sgemm on CPU. RMSNorm backward via vDSP.
+2. **Backward pass**: Reverse layer order. `ffnBwd`, `sdpaBwd1`, `sdpaBwd2`, `qkvBwd` on ANE. Weight gradients (dW) via async `cblas_sgemm` on CPU. RMSNorm backward via vDSP.
 
 3. **Compile budget**: ANE has a ~119 compile limit per process. With 72 kernels per batch, we run 10 accumulation steps then `exec()` restart with checkpoint resume.
 
@@ -48,22 +54,64 @@ Training a 109M-parameter Llama2-architecture transformer (Stories110M) directly
 ## Usage
 
 ```bash
-# Extract tokenized data
+# 1. Extract tokenized data (needs ~/tiny_stories_data_pretokenized.zip)
 python3 tokenize.py
 
-# Build and train
+# 2. Build and train
 make train_large
-./train_large                    # fresh start
-./train_large --resume           # resume from checkpoint
+./train_large                     # start fresh
+./train_large --resume            # resume from checkpoint
 
-# Monitor with dashboard
+# 3. Monitor with dashboard
 pip install blessed psutil numpy
-python3 dashboard.py --resume    # needs sudo for powermetrics
+python3 dashboard.py --resume     # spawns train_large, shows TUI
+python3 dashboard.py --infinite   # train indefinitely
+python3 dashboard.py --no-powermetrics  # skip sudo for power monitoring
 ```
 
-## Key techniques
+### Dashboard Controls
+
+| Key | Action |
+|-----|--------|
+| `q` | Quit |
+| `r` | Restart training with --resume |
+| `g` | Force text generation from current checkpoint |
+| `p` | Toggle auto-scroll on logs |
+| Up/Down | Scroll logs |
+
+## Tests
+
+### Python Tests (cross-platform)
+
+```bash
+pip install pytest numpy
+python3 -m pytest test_dashboard.py -v
+```
+
+59 tests covering: `rmsnorm`, `softmax`, `braille_chart`, `parse_line`, `parse_powermetrics_text`, `Tokenizer.decode`, regex patterns, RoPE vectorization correctness, and edge cases.
+
+### ANE Probe Tests (macOS Apple Silicon only)
+
+```bash
+make probes
+./test_weight_reload    # Weight blob reload without recompilation
+./test_perf_stats       # ANE performance statistics API
+./test_qos_sweep        # QoS impact on latency/frequency
+./test_ane_advanced      # SharedEvents, VirtualClient, ChainingRequest APIs
+```
+
+Additional kernel tests (built individually):
+- `test_ane_causal_attn.m` — Decomposed causal attention (Q@K^T -> mask+softmax -> scores@V)
+- `test_full_fused.m` — Full fused forward pass (QKV convs + matmul + softmax + output)
+- `test_ane_sdpa5.m` — Scaled dot-product attention with 5 operations
+- `test_conv_attn3.m` — Convolution-based attention with 3 operations
+- `test_fused_qkv.m` — Fused QKV projection kernels
+- `test_fused_bwd.m` — Backward pass kernels for FFN and SDPA
+
+## Key Techniques
 
 - **NEON vectorized fp16<->fp32**: ARM NEON intrinsics for fast IOSurface data transfer
 - **vDSP cross-entropy**: `vDSP_mtrans` + `vvexpf` + `vDSP_sve` — 8x faster than scalar
-- **Async weight gradients**: cblas_sgemm dispatched to background queue, overlapped with ANE
-- **SDPA causal mask workaround**: ANE hardware ignores attn_mask, so we decompose attention into Q@K^T (ANE conv) + mask+softmax (CPU) + scores@V (ANE conv)
+- **Async weight gradients**: `cblas_sgemm` dispatched to background queue, overlapped with ANE
+- **Vectorized RoPE** (dashboard): NumPy `np.outer` + `np.cos`/`np.sin` replacing nested Python loops
+- **SDPA causal mask workaround**: ANE hardware ignores `attn_mask`, so attention is decomposed into Q@K^T (ANE conv) -> mask+softmax (ANE) -> scores@V (ANE conv)
