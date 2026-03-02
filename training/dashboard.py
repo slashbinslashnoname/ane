@@ -1,6 +1,6 @@
 """TUI dashboard for ANE training (train_large). Uses blessed for terminal UI."""
 
-import argparse, fcntl, math, os, re, select, signal, struct, subprocess, sys, time, threading
+import argparse, fcntl, itertools, math, os, re, select, signal, struct, subprocess, sys, time, threading
 from collections import deque
 from pathlib import Path
 
@@ -79,7 +79,7 @@ class Tokenizer:
             if s.startswith('<0x') and s.endswith('>'):
                 try:
                     return chr(int(s[3:-1], 16))
-                except:
+                except (ValueError, OverflowError):
                     return s
             return s
         return ''
@@ -150,12 +150,10 @@ def generate_text(W, tok, max_tokens=64, temperature=0.8):
     tokens = [1]
     text_parts = []
 
-    # Precompute RoPE frequencies
-    freqs = np.zeros((SEQ, HD // 2), dtype=np.float32)
-    for pos in range(SEQ):
-        for i in range(HD // 2):
-            freq = 1.0 / (10000.0 ** (2.0 * i / HD))
-            freqs[pos, i] = pos * freq
+    # Precompute RoPE frequencies (vectorized)
+    positions = np.arange(SEQ, dtype=np.float32)
+    freq_base = 1.0 / (10000.0 ** (2.0 * np.arange(HD // 2, dtype=np.float32) / HD))
+    freqs = np.outer(positions, freq_base)
 
     for step in range(max_tokens):
         seq_len = len(tokens)
@@ -171,18 +169,19 @@ def generate_text(W, tok, max_tokens=64, temperature=0.8):
             k = W[f'Wk{L}'] @ xn
             v = W[f'Wv{L}'] @ xn
 
-            # RoPE
+            # RoPE (vectorized)
             pos = seq_len - 1
-            for h in range(HEADS):
-                for i in range(HD // 2):
-                    freq = freqs[pos, i]
-                    cos_v, sin_v = math.cos(freq), math.sin(freq)
-                    qi, qi1 = q[h * HD + 2 * i], q[h * HD + 2 * i + 1]
-                    q[h * HD + 2 * i] = qi * cos_v - qi1 * sin_v
-                    q[h * HD + 2 * i + 1] = qi * sin_v + qi1 * cos_v
-                    ki, ki1 = k[h * HD + 2 * i], k[h * HD + 2 * i + 1]
-                    k[h * HD + 2 * i] = ki * cos_v - ki1 * sin_v
-                    k[h * HD + 2 * i + 1] = ki * sin_v + ki1 * cos_v
+            freq_vec = freqs[pos, :]  # (HD//2,)
+            cos_v = np.cos(freq_vec)
+            sin_v = np.sin(freq_vec)
+            cos_full = np.tile(cos_v, HEADS)  # (DIM//2,)
+            sin_full = np.tile(sin_v, HEADS)
+            q_even, q_odd = q[0::2].copy(), q[1::2].copy()
+            q[0::2] = q_even * cos_full - q_odd * sin_full
+            q[1::2] = q_even * sin_full + q_odd * cos_full
+            k_even, k_odd = k[0::2].copy(), k[1::2].copy()
+            k[0::2] = k_even * cos_full - k_odd * sin_full
+            k[1::2] = k_even * sin_full + k_odd * cos_full
 
             # Attention (single token)
             o = np.zeros(DIM, dtype=np.float32)
@@ -249,7 +248,6 @@ def generation_thread():
                 S.gen_text = text
                 S.gen_step = S.step
                 S.gen_status = 'done'
-            S.step  # just to reference
         except Exception as e:
             with S.gen_lock:
                 S.gen_text = f'[error: {e}]'
@@ -437,6 +435,10 @@ def braille_chart(values, width, height, label_fmt='{:.1f}', y_range=None):
     return lines
 
 
+def _pad_lines(lines, target_len, fill_width):
+    while len(lines) < target_len:
+        lines.append(' ' * fill_width)
+
 def draw(term):
     w, h = term.width, term.height
     if w < 40 or h < 15:
@@ -561,10 +563,8 @@ def draw(term):
         ane_lines = braille_chart(ane_vals, left_w - 1, power_h, label_fmt='{:.1f}')
         cpu_lines = braille_chart(cpu_vals, right_w - 1, power_h, label_fmt='{:.1f}')
         max_lines = max(len(ane_lines), len(cpu_lines))
-        while len(ane_lines) < max_lines:
-            ane_lines.append(' ' * (left_w - 1))
-        while len(cpu_lines) < max_lines:
-            cpu_lines.append(' ' * (right_w - 1))
+        _pad_lines(ane_lines, max_lines, left_w - 1)
+        _pad_lines(cpu_lines, max_lines, right_w - 1)
         for i in range(max_lines):
             put(row + i, 0, '\u2502', term.cyan)
             put(row + i, 1, ane_lines[i], term.red)
@@ -584,10 +584,8 @@ def draw(term):
         cpu_lines = braille_chart(cpu_vals, left_w - 1, power_h, label_fmt='{:.0f}', y_range=(0, 100))
         mem_lines = braille_chart(mem_vals, right_w - 1, power_h, label_fmt='{:.0f}')
         max_lines = max(len(cpu_lines), len(mem_lines))
-        while len(cpu_lines) < max_lines:
-            cpu_lines.append(' ' * (left_w - 1))
-        while len(mem_lines) < max_lines:
-            mem_lines.append(' ' * (right_w - 1))
+        _pad_lines(cpu_lines, max_lines, left_w - 1)
+        _pad_lines(mem_lines, max_lines, right_w - 1)
         for i in range(max_lines):
             put(row + i, 0, '\u2502', term.cyan)
             put(row + i, 1, cpu_lines[i], term.yellow)
@@ -626,13 +624,13 @@ def draw(term):
     put(row, 0, '\u251c\u2500 Logs' + scroll_hint + '\u2500' * max(0, w - 8 - len(scroll_hint)) + '\u2524', term.cyan)
     row += 1
 
-    logs = list(S.logs)
-    if log_h > 0 and logs:
+    log_count = len(S.logs)
+    if log_h > 0 and log_count > 0:
         if S.auto_scroll:
-            start = max(0, len(logs) - log_h)
+            start = max(0, log_count - log_h)
         else:
-            start = max(0, min(S.log_scroll, len(logs) - log_h))
-        visible = logs[start:start + log_h]
+            start = max(0, min(S.log_scroll, log_count - log_h))
+        visible = list(itertools.islice(S.logs, start, start + log_h))
         for i, line in enumerate(visible):
             put(row + i, 0, '\u2502', term.cyan)
             if RE_STEP.search(line):
