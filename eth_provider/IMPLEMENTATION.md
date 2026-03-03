@@ -1,16 +1,16 @@
 # ANE Compute Provider — Implementation Spec
 
-MVP implementation: Secure Enclave attestation + Proof of Sampling + x402 payments. Architecture-agnostic, sandboxed execution, multi-tenant. Supports any model architecture — decoder-only, encoder-only, encoder-decoder, MoE, vision, and diffusion.
+MVP implementation: Secure Enclave attestation + Proof of Sampling + x402 payments. Fully open plugin architecture — zero hardcoded models. Any architecture, any format, any work. Sandboxed execution, multi-tenant.
 
 ---
 
 ## 1. Design Principles
 
-1. **Architecture-agnostic.** The provider accepts any model architecture — decoder-only transformers (Llama, GPT-2, Mamba), encoder-only (BERT), encoder-decoder (T5, BART), mixture-of-experts (Mixtral, DBRX), vision transformers (ViT, CLIP), and diffusion models (Stable Diffusion). Models are opaque weight blobs identified by hash, routed to the correct inference template by architecture tag.
-2. **Isolated.** Each job runs in a sandboxed subprocess with its own memory, temp directory, and ANE kernel set. A crash or malicious model cannot affect other jobs or the host.
-3. **Stateless between jobs.** No job state persists after completion. KV-cache, activations, compiled kernels — all freed. The provider is a pure function: `(model, input) → (output, proof)`.
-4. **Minimal trust surface.** The provider binary is open-source and deterministically compiled. The Secure Enclave signs every result. The provider operator cannot tamper with outputs without invalidating the SEP attestation.
-5. **Extensible.** New architectures are added by dropping in a new inference template + weight adapter. No changes to the gateway, sandbox, proof system, or payment layer.
+1. **Zero hardcoded models.** The provider has no built-in knowledge of any specific model or architecture. It discovers capabilities at startup by scanning plugin directories. Templates, adapters, and format readers are all plugins. The core system is a generic pipeline: `upload → detect → adapt → compile → sandbox → prove`.
+2. **Plugin-first.** Support for a new architecture = drop files in a directory. No code changes to the gateway, sandbox, scheduler, proof system, or payment layer. No redeployment. No registry edits. The plugin declares what it handles.
+3. **Isolated.** Each job runs in a sandboxed subprocess with its own memory, temp directory, and ANE kernel set. A crash or malicious model cannot affect other jobs or the host.
+4. **Stateless between jobs.** No job state persists after completion. KV-cache, activations, compiled kernels — all freed. The provider is a pure function: `(model, input) → (output, proof)`.
+5. **Minimal trust surface.** The provider binary is open-source and deterministically compiled. The Secure Enclave signs every result. The provider operator cannot tamper with outputs without invalidating the SEP attestation.
 
 ---
 
@@ -64,255 +64,327 @@ MVP implementation: Secure Enclave attestation + Proof of Sampling + x402 paymen
 
 ---
 
-## 3. Model Abstraction Layer
+## 3. Plugin Architecture
 
-The current codebase hardcodes Stories110M dimensions everywhere (`#define DIM 768`, etc.). The provider must support any model architecture. Instead of rewriting the entire C codebase to be dynamic, we use a **compilation-per-model** strategy with an **architecture registry** that routes each model to the correct inference template.
+The provider has **zero hardcoded knowledge** of any specific model or architecture. Everything is discovered at runtime from plugin directories. The core system is a generic pipeline; all model-specific logic lives in plugins.
 
-### 3.1 Architecture Registry
+### 3.1 Plugin Discovery
 
-The core abstraction: every model architecture is a `(template, weight_adapter)` pair. The template defines the ANE compute graph. The weight adapter parses the model's native weight format and maps tensors into the template's expected layout.
+At startup, the provider scans three plugin directories and builds its capability set dynamically:
+
+```
+~/.ane_provider/
+├── plugins/
+│   ├── templates/    ← Inference templates (*.m.tmpl + manifest.yaml)
+│   ├── adapters/     ← Weight adapters (*.py, auto-imported)
+│   └── formats/      ← Format readers (*.py, auto-imported)
+```
 
 ```python
-# Architecture registry — maps architecture tag to (template, adapter)
-ARCHITECTURES = {
-    # Decoder-only, RMSNorm + SwiGLU + RoPE
-    "llama":       ("inference_llama.m.tmpl",    LlamaAdapter),
-    "mistral":     ("inference_llama.m.tmpl",    MistralAdapter),
-    "phi3":        ("inference_llama.m.tmpl",    Phi3Adapter),
-    "gemma":       ("inference_llama.m.tmpl",    GemmaAdapter),
-    "qwen":        ("inference_llama.m.tmpl",    QwenAdapter),
+# At startup — NO hardcoded list anywhere
+class PluginLoader:
+    def __init__(self, plugin_dir: str):
+        self.templates = {}   # pattern_tag → TemplatePlugin
+        self.adapters  = []   # [AdapterPlugin, ...]
+        self.formats   = []   # [FormatPlugin, ...]
 
-    # Decoder-only, LayerNorm + GELU
-    "gpt2":        ("inference_gpt.m.tmpl",      GPT2Adapter),
-    "gpt-neox":    ("inference_gpt.m.tmpl",      NeoXAdapter),
-    "opt":         ("inference_gpt.m.tmpl",      OPTAdapter),
-    "pythia":      ("inference_gpt.m.tmpl",      NeoXAdapter),
+    def scan(self):
+        """Walk plugin dirs. Import all .py modules. Parse all .yaml manifests.
+        Each plugin self-registers by declaring what it handles."""
 
-    # Decoder-only, state-space
-    "mamba":       ("inference_mamba.m.tmpl",     MambaAdapter),
+        # Templates: scan for *.m.tmpl files, read their sidecar manifest.yaml
+        for manifest_path in glob("plugins/templates/*/manifest.yaml"):
+            tpl = TemplatePlugin.from_manifest(manifest_path)
+            self.templates[tpl.pattern] = tpl
 
-    # Encoder-only
-    "bert":        ("inference_encoder.m.tmpl",  BERTAdapter),
-    "roberta":     ("inference_encoder.m.tmpl",  RoBERTaAdapter),
+        # Adapters: import all .py files, collect subclasses of AdapterPlugin
+        for py_file in glob("plugins/adapters/*.py"):
+            module = importlib.import_module(py_file)
+            for cls in find_subclasses(module, AdapterPlugin):
+                self.adapters.append(cls())
 
-    # Encoder-decoder
-    "t5":          ("inference_encdec.m.tmpl",   T5Adapter),
-    "bart":        ("inference_encdec.m.tmpl",   BARTAdapter),
-    "flan-t5":     ("inference_encdec.m.tmpl",   T5Adapter),
-
-    # Mixture of experts (dense layers on ANE, routing on CPU)
-    "mixtral":     ("inference_moe.m.tmpl",      MixtralAdapter),
-    "dbrx":        ("inference_moe.m.tmpl",      DBRXAdapter),
-
-    # Vision
-    "vit":         ("inference_vit.m.tmpl",      ViTAdapter),
-    "clip":        ("inference_clip.m.tmpl",     CLIPAdapter),
-
-    # Diffusion
-    "sd-unet":     ("inference_diffusion.m.tmpl", SDUNetAdapter),
-}
+        # Formats: import all .py files, collect subclasses of FormatPlugin
+        for py_file in glob("plugins/formats/*.py"):
+            module = importlib.import_module(py_file)
+            for cls in find_subclasses(module, FormatPlugin):
+                self.formats.append(cls())
 ```
 
-Adding a new architecture = adding one template file + one adapter class. No changes to gateway, sandbox, proof system, or payments.
+**No code changes to add support for a new model.** Drop files in the plugin directories. Restart (or hot-reload). Done.
 
-### 3.2 Model Manifest
+### 3.2 Template Plugins
 
-Every model in the store has a manifest. The `architecture` field selects the template. The `config` fields are architecture-specific.
+A template plugin is a directory containing an inference template (`.m.tmpl`) and a manifest that declares what it handles. The manifest is the template's self-description — the provider never needs to know what's inside the template.
 
-```json
-{
-  "model_id": "sha256:<hash of weights.bin>",
-  "architecture": "llama",
-  "format": "safetensors",
-  "config": {
-    "dim": 4096,
-    "hidden_dim": 11008,
-    "n_layers": 32,
-    "n_heads": 32,
-    "n_kv_heads": 8,
-    "vocab_size": 32000,
-    "seq_len": 4096,
-    "norm_type": "rmsnorm",
-    "activation": "swiglu",
-    "position_encoding": "rope",
-    "rope_theta": 10000.0
-  },
-  "size_bytes": 13500000000,
-  "uploaded_at": "2026-03-03T12:00:00Z"
-}
+```
+plugins/templates/
+├── decoder_rmsnorm_swiglu/
+│   ├── manifest.yaml
+│   ├── inference.m.tmpl
+│   └── deps/                  ← Optional extra headers
+│       └── rope.h
+├── decoder_layernorm_gelu/
+│   ├── manifest.yaml
+│   └── inference.m.tmpl
+├── encoder_bidirectional/
+│   ├── manifest.yaml
+│   └── inference.m.tmpl
+├── encoder_decoder/
+│   ├── manifest.yaml
+│   └── inference.m.tmpl
+├── moe_topk/
+│   ├── manifest.yaml
+│   ├── inference.m.tmpl
+│   └── deps/
+│       └── router.h
+├── state_space/
+│   ├── manifest.yaml
+│   ├── inference.m.tmpl
+│   └── deps/
+│       └── ssm.h
+├── vision_patch/
+│   ├── manifest.yaml
+│   └── inference.m.tmpl
+├── diffusion_unet/
+│   ├── manifest.yaml
+│   ├── inference.m.tmpl
+│   └── deps/
+│       └── unet.h
+└── ... (any user-added template)
 ```
 
-For non-transformer architectures, `config` carries different fields:
+**Template manifest** (`manifest.yaml`):
 
-```json
-{
-  "architecture": "sd-unet",
-  "config": {
-    "in_channels": 4,
-    "out_channels": 4,
-    "block_out_channels": [320, 640, 1280, 1280],
-    "attention_head_dim": 8,
-    "cross_attention_dim": 768,
-    "timestep_embedding_dim": 1280
-  }
-}
+```yaml
+# Self-description. The provider reads this, never the template source.
+pattern: "decoder_rmsnorm_swiglu"
+version: 1
+description: "Decoder-only transformer with RMSNorm, SwiGLU activation, RoPE"
+
+# What config fields this template requires (used for validation)
+required_config:
+  - dim           # Model dimension
+  - hidden_dim    # FFN hidden dimension
+  - n_layers      # Number of transformer layers
+  - n_heads       # Number of attention heads
+  - n_kv_heads    # Number of key-value heads (for GQA)
+  - vocab_size    # Vocabulary size
+  - seq_len       # Maximum sequence length
+
+# Optional config with defaults (template substitutes %%KEY%% → value)
+optional_config:
+  rope_theta: 10000.0
+  norm_eps: 1e-5
+
+# What this template produces
+output_type: "token_sequence"        # or "embedding", "classification", "image"
+supports_kv_cache: true
+supports_batching: false
+
+# Compile command (%%TEMPLATE_SRC%% and %%OUTPUT_BIN%% are injected)
+compile: "xcrun clang -O2 -o %%OUTPUT_BIN%% %%TEMPLATE_SRC%% -framework Foundation -framework Accelerate"
+
+# Resource hints (for scheduling & admission control)
+resource_hints:
+  memory_per_param_bytes: 2          # fp16
+  ane_kernels_per_layer: 4
+  cpu_ops: ["rope", "sampling"]
 ```
 
-```json
-{
-  "architecture": "mamba",
-  "config": {
-    "dim": 2560,
-    "n_layers": 64,
-    "ssm_state_size": 16,
-    "ssm_conv_width": 4,
-    "expand_factor": 2,
-    "vocab_size": 50280
-  }
-}
-```
+The provider never parses template C code. It only reads the manifest, substitutes `%%PLACEHOLDER%%` values from the model config into the template source, compiles, and runs.
 
-### 3.3 Weight Adapters
+### 3.3 Adapter Plugins
 
-A weight adapter is a Python class that reads a specific weight format and produces a normalized binary blob that the compiled template binary can `mmap`:
+An adapter plugin knows how to read a specific model family's weight layout and map it to a normalized binary format that a template can consume. Adapters are Python files dropped into `plugins/adapters/`.
 
 ```python
-class WeightAdapter:
-    """Base class. Subclass for each model family."""
+class AdapterPlugin:
+    """Base class. Each adapter is a .py file in plugins/adapters/."""
 
-    def detect(self, path: str) -> dict:
-        """Read model file, return config dict or raise ValueError."""
-        raise NotImplementedError
-
-    def export(self, path: str, config: dict, output_path: str):
-        """Convert weights to template-expected binary layout.
-        Output: contiguous float16 arrays in canonical order."""
+    @property
+    def name(self) -> str:
+        """Unique adapter name, e.g. 'hf_causal_lm'."""
         raise NotImplementedError
 
     @property
-    def architecture(self) -> str:
+    def pattern(self) -> str:
+        """The template pattern this adapter targets, e.g. 'decoder_rmsnorm_swiglu'.
+        Must match a template's manifest.yaml pattern field."""
+        raise NotImplementedError
+
+    def can_handle(self, metadata: dict, format_hint: str) -> float:
+        """Given parsed metadata from a format reader, return confidence 0.0-1.0
+        that this adapter can handle the model. 0.0 = cannot, 1.0 = certain.
+        Allows multiple adapters to compete; highest confidence wins."""
+        raise NotImplementedError
+
+    def extract_config(self, metadata: dict) -> dict:
+        """Extract template config fields from model metadata.
+        Returns dict matching the template's required_config fields."""
+        raise NotImplementedError
+
+    def export_weights(self, source_path: str, metadata: dict,
+                       config: dict, output_path: str):
+        """Read weights from source file, reorder/cast as needed,
+        write to output_path in ANEW normalized layout."""
         raise NotImplementedError
 ```
 
-Example adapter logic for different formats:
+**Key design: confidence scoring, not hardcoded matching.** When a model is uploaded, every adapter gets a chance to claim it. The adapter with the highest `can_handle()` score wins. This means:
+
+- Two adapters can handle the same model family differently (community vs. official)
+- A generic "HuggingFace CausalLM" adapter can handle any HF model that follows the standard naming convention
+- A specialized adapter can override the generic one with higher confidence for models it knows well
+
+```python
+# Example: a GENERIC adapter that handles any HuggingFace causal LM
+class HFCausalLMAdapter(AdapterPlugin):
+    name = "hf_causal_lm"
+    pattern = "decoder_rmsnorm_swiglu"  # default, overridden by metadata
+
+    def can_handle(self, metadata, format_hint):
+        # If it has 'model_type' in config.json, we can probably handle it
+        if "model_type" in metadata:
+            return 0.5  # generic confidence
+        return 0.0
+
+    def extract_config(self, metadata):
+        # Generic HF config.json → template config mapping
+        hf = metadata
+        return {
+            "dim":        hf.get("hidden_size", hf.get("d_model")),
+            "hidden_dim": hf.get("intermediate_size", hf.get("d_ff")),
+            "n_layers":   hf.get("num_hidden_layers", hf.get("n_layer")),
+            "n_heads":    hf.get("num_attention_heads", hf.get("n_head")),
+            "n_kv_heads": hf.get("num_key_value_heads",
+                           hf.get("num_attention_heads")),
+            "vocab_size": hf["vocab_size"],
+            "seq_len":    hf.get("max_position_embeddings", 2048),
+        }
+
+    @property
+    def pattern(self):
+        # Could dynamically select pattern based on model metadata
+        # e.g., check if it uses RMSNorm vs LayerNorm
+        return self._detected_pattern or "decoder_rmsnorm_swiglu"
+```
+
+### 3.4 Format Plugins
+
+A format plugin knows how to open a specific file format (safetensors, GGUF, ONNX, etc.) and extract metadata + raw tensor data. Format plugins are also auto-discovered from `plugins/formats/`.
+
+```python
+class FormatPlugin:
+    """Base class. Each format reader is a .py file in plugins/formats/."""
+
+    @property
+    def name(self) -> str:
+        """Format name, e.g. 'safetensors'."""
+        raise NotImplementedError
+
+    def can_read(self, path: str) -> bool:
+        """Check magic bytes / extension. Return True if this format reader
+        can parse the file."""
+        raise NotImplementedError
+
+    def read_metadata(self, path: str) -> dict:
+        """Parse file header / config. Return metadata dict containing
+        architecture hints, dimensions, tensor names, etc."""
+        raise NotImplementedError
+
+    def iter_tensors(self, path: str) -> Iterator[Tuple[str, np.ndarray]]:
+        """Yield (tensor_name, tensor_data) pairs.
+        Tensor data as numpy arrays (any dtype, adapter will cast)."""
+        raise NotImplementedError
+```
+
+Format readers **don't know** about architectures. They just parse files. The adapter layer maps parsed metadata to template configs.
 
 ```
-LlamaAdapter.detect():
-  - Read 28-byte header (7 ints): dim, hidden, layers, heads, kv_heads, vocab, seq
-  - Return config dict
+Upload pipeline (fully plugin-driven):
 
-GPT2Adapter.detect():
-  - Read safetensors/HF metadata
-  - Extract: n_embd, n_layer, n_head, vocab_size, n_positions
-  - Map to: dim=n_embd, hidden=4*n_embd, n_layers=n_layer, etc.
-  - Return config dict
-
-BERTAdapter.detect():
-  - Read config.json: hidden_size, num_hidden_layers, num_attention_heads, intermediate_size
-  - Map to: dim=hidden_size, hidden=intermediate_size, n_layers, etc.
-  - Return config dict
-
-SDUNetAdapter.detect():
-  - Read diffusion_pytorch_model.safetensors metadata
-  - Extract channel dimensions, attention config
-  - Return config dict
+  1. File arrives
+  2. Try each FormatPlugin.can_read() → first match opens the file
+  3. FormatPlugin.read_metadata() → raw metadata dict
+  4. Try each AdapterPlugin.can_handle(metadata) → highest confidence wins
+  5. AdapterPlugin.extract_config(metadata) → template config dict
+  6. AdapterPlugin.pattern → selects which TemplatePlugin to use
+  7. Validate config against template's required_config
+  8. AdapterPlugin.export_weights() → normalized ANEW binary
+  9. Template substitution → model-specific .m source
+  10. Compile → binary
+  11. Hash → manifest → serve
 ```
 
-**Weight layout contract**: Every adapter exports weights as a contiguous binary blob with a standard header:
+Every step is pluggable. No step has hardcoded knowledge of any specific model.
+
+### 3.5 Normalized Weight Format (ANEW)
+
+The contract between adapters and templates. Adapters write this format; template binaries `mmap` and read it. Architecture-neutral.
 
 ```c
-struct WeightHeader {
+struct ANEWHeader {
     uint32_t magic;              // 0x414E4557 ("ANEW")
     uint32_t version;            // 1
-    char     architecture[32];   // "llama", "gpt2", "bert", etc.
+    char     pattern[64];        // Template pattern name (e.g., "decoder_rmsnorm_swiglu")
     uint32_t n_tensors;          // Number of weight tensors
-    uint32_t dtype;              // 0=fp32, 1=fp16
-    // Followed by tensor offsets table, then contiguous weight data
+    uint32_t dtype;              // 0=fp32, 1=fp16, 2=bf16, 3=int8, 4=int4
+    uint64_t data_offset;        // Byte offset to first tensor data
+    // Followed by tensor table:
+    //   struct { char name[64]; uint64_t offset; uint64_t size_bytes; uint32_t shape[4]; }
+    // Then contiguous tensor data
 };
 ```
 
-### 3.4 Templated Compilation
+**Tensor naming convention** — templates define what tensor names they expect (in the manifest or as constants in the template source). Adapters map model-native tensor names to template-expected names:
 
-Rather than making the C code dynamic (fragile, 50+ locations to change), we **generate a model-specific C source file from a template** at model registration time, compile it once, and cache the binary.
+```yaml
+# In template manifest.yaml
+tensor_layout:
+  - "layers.{i}.attention.wq"      # Shape: [dim, dim]
+  - "layers.{i}.attention.wk"      # Shape: [dim, kv_dim]
+  - "layers.{i}.attention.wv"      # Shape: [dim, kv_dim]
+  - "layers.{i}.attention.wo"      # Shape: [dim, dim]
+  - "layers.{i}.ffn.w1"            # Shape: [hidden_dim, dim]
+  - "layers.{i}.ffn.w2"            # Shape: [dim, hidden_dim]
+  - "layers.{i}.ffn.w3"            # Shape: [hidden_dim, dim]
+  - "layers.{i}.norm1"             # Shape: [dim]
+  - "layers.{i}.norm2"             # Shape: [dim]
+  - "token_embedding"              # Shape: [vocab_size, dim]
+  - "output_norm"                  # Shape: [dim]
+  - "output_proj"                  # Shape: [vocab_size, dim]
+```
+
+The adapter's job: map `model.layers.0.self_attn.q_proj.weight` → `layers.0.attention.wq` (or whatever the source model calls it).
+
+### 3.6 Templated Compilation
+
+Templates are Objective-C source files with `%%PLACEHOLDER%%` tokens. The provider substitutes values from the model config, compiles once, caches the binary.
 
 ```
-Model registration flow:
+Substitution rules:
+  - %%KEY%% → config[key]         for required_config and optional_config keys
+  - %%NLAYERS%% → config[n_layers]
+  - %%DIM%% → config[dim]
+  - etc.
 
-  1. Client uploads model (any format: safetensors, GGUF, llama2c, ONNX, bin)
-  2. Auto-detect: try each adapter's detect() until one succeeds
-     - Or client specifies architecture explicitly in upload metadata
-  3. Adapter exports weights to normalized binary layout
-  4. Select template by architecture tag from registry
-  5. Generate model-specific C source from template:
-     - sed s/%%DIM%%/4096/g; s/%%HIDDEN%%/11008/g; s/%%NORM%%/rmsnorm/g; ...
-  6. Compile: xcrun clang -O2 -o inference_<hash> inference_<hash>.m ...
-  7. Hash binary: binary_hash = sha256(inference_<hash>)
-  8. Store binary + normalized weights + manifest in model store
+The template source uses these as #define values:
+  #define DIM %%dim%%
+  #define HIDDEN %%hidden_dim%%
+  #define HEADS %%n_heads%%
+  // ... template handles the rest
 ```
 
-**Why this approach:**
-- ANE kernels are compiled with dimensions baked in anyway (MIL text embeds tensor shapes). Dynamic dims don't help at the ANE level.
+**Why compile-per-model instead of dynamic:**
+- ANE kernels bake tensor shapes into MIL programs. Dynamic dimensions don't help at the hardware level.
 - A pre-compiled binary per model is faster than parsing config at runtime.
-- The binary hash becomes part of the attestation — anyone can reproduce it from the same source + weights.
-- No risk of buffer overflows from dynamic allocation mistakes.
+- The binary hash becomes part of the attestation — anyone can reproduce it from the same template + config.
+- No buffer overflow risk from dynamic allocation mistakes.
 - Architecture-specific optimizations (fused kernels, layout choices) live in the template, not in runtime branching.
 
-### 3.5 Template Anatomy
+### 3.7 Shared Headers
 
-Each template is a complete inference implementation for one architecture family. Templates share common ANE primitives (MIL generation, IOSurface I/O, SEP signing) via shared headers but differ in compute graph structure.
-
-```
-Templates and what they implement:
-
-inference_llama.m.tmpl
-  Block: RMSNorm → QKV → RoPE → Causal SDPA → Wo → Residual → RMSNorm → SwiGLU FFN → Residual
-  ANE kernels: fused_qkv, fused_ffn_up, wo_proj, ffn_down (per layer)
-  CPU: RoPE, causal masking, sampling
-
-inference_gpt.m.tmpl
-  Block: LayerNorm → QKV → Causal Attn → Wo → Residual → LayerNorm → GELU FFN → Residual
-  ANE kernels: qkv_proj, ffn_up_gelu, wo_proj, ffn_down (per layer)
-  CPU: positional embeddings (learned, not RoPE), sampling
-
-inference_encoder.m.tmpl
-  Block: LayerNorm → QKV → Bidirectional Attn → Wo → Residual → LayerNorm → GELU FFN → Residual
-  ANE kernels: same as GPT but NO causal mask
-  CPU: [CLS] pooling, classification head
-
-inference_encdec.m.tmpl
-  Two stacks: encoder (bidirectional) + decoder (causal + cross-attention)
-  ANE kernels: encoder_block, decoder_self_attn, decoder_cross_attn, ffn
-  CPU: beam search, length penalty
-
-inference_moe.m.tmpl
-  Block: same as llama but FFN replaced by top-k expert routing
-  ANE kernels: fused_qkv, wo_proj, expert_ffn (per expert, compiled once, dispatched per-token)
-  CPU: router (gating network), expert selection, token-to-expert dispatch
-
-inference_mamba.m.tmpl
-  Block: selective state space model (no attention)
-  ANE kernels: ssm_conv, ssm_scan (selective scan as conv chain)
-  CPU: discretization (ZOH), state update
-
-inference_vit.m.tmpl
-  Patch embedding → positional embedding → encoder blocks → classification head
-  ANE kernels: patch_embed_conv, encoder_block (bidirectional attn + MLP)
-  CPU: patch extraction, classification
-
-inference_clip.m.tmpl
-  Dual encoder: ViT (image) + GPT (text) → contrastive similarity
-  ANE kernels: image_encoder, text_encoder
-  CPU: cosine similarity, contrastive loss
-
-inference_diffusion.m.tmpl
-  UNet: downsample → middle → upsample with skip connections + cross-attention
-  ANE kernels: resnet_block, cross_attn, downsample_conv, upsample_conv
-  CPU: timestep scheduling, noise prediction loop, VAE decode
-```
-
-### 3.6 Shared Headers
-
-All templates include the same core headers:
+All templates include the same core headers via `#include`. These are the only non-plugin components:
 
 | Header | Contents |
 |--------|----------|
@@ -320,50 +392,28 @@ All templates include the same core headers:
 | `ane_mil_gen.h` | MIL text generation helpers (conv, matmul, softmax, etc.) |
 | `proof_output.h` | Logits hashing, layer checkpoints, proof JSON serialization |
 | `sep_sign.h` | Secure Enclave key management and signing |
-| `weight_io.h` | Normalized weight blob loading (mmap + header parse) |
+| `weight_io.h` | ANEW normalized weight blob loading (mmap + header parse) |
 
-Architecture-specific headers:
-| Header | Used by |
-|--------|---------|
-| `rope.h` | Llama, Mistral — RoPE position encoding |
-| `layernorm.h` | GPT, BERT, T5 — LayerNorm (vs RMSNorm) |
-| `moe_router.h` | Mixtral, DBRX — top-k expert gating |
-| `ssm.h` | Mamba — selective state space discretization |
-| `unet.h` | Stable Diffusion — UNet skip connections, timestep embedding |
-
-### 3.7 Supported Formats & Auto-Detection
-
-The provider accepts models in any common format. Auto-detection priority:
-
-| Priority | Format | Detection | Architectures |
-|----------|--------|-----------|---------------|
-| 1 | Safetensors | `.safetensors` extension, JSON header | All (HuggingFace standard) |
-| 2 | GGUF | Magic bytes `GGUF` at offset 0 | All (llama.cpp ecosystem) |
-| 3 | llama2.c | 28-byte int header, size matches config | Llama family |
-| 4 | ONNX | Magic bytes `\x08` (protobuf) | All |
-| 5 | PyTorch | Magic bytes `PK` (zip) | All (with config.json) |
-
-For safetensors and GGUF, architecture is auto-detected from metadata. For raw binary formats, the client must specify `architecture` in the upload request.
+Templates can also include their own headers from their `deps/` directory (e.g., `rope.h`, `ssm.h`, `router.h`). These travel with the template plugin — not managed by the core system.
 
 ### 3.8 ANE Primitive Coverage
 
-Every architecture decomposes into the same small set of ANE primitives. This is why one accelerator can run all of them:
+Any computation that decomposes into these MIL operations can run on ANE. This is the hardware's instruction set — not a list of supported models:
 
-| ANE Primitive | MIL Op | Used By |
-|---------------|--------|---------|
-| Linear projection | `conv(weight, x, pad="valid")` | All (QKV, FFN, embeddings) |
-| MatMul (attention) | `matmul(Q, K^T)` | All attention-based models |
-| Softmax | `softmax(x)` | All attention-based models |
-| RMSNorm | `reduce_sum(x*x) + pow + mul` | Llama, Mistral, Gemma, Qwen |
-| LayerNorm | `reduce_mean + reduce_sum + mul + add` | GPT-2, BERT, T5, BART, ViT |
-| SiLU/SwiGLU | `sigmoid(x) * x * gate` | Llama, Mistral |
-| GELU | `x * 0.5 * (1 + tanh(...))` | GPT-2, BERT, T5, ViT |
-| ReLU | `max(x, 0)` | OPT, older models |
-| Convolution (spatial) | `conv(weight, x, pad=...)` | Diffusion UNet, Mamba (1D conv) |
-| Element-wise add | `add(x, y)` | All (residual connections) |
-| Concat | `concat(x, y, dim)` | UNet skip connections, forward taps |
+| ANE Primitive | MIL Op | Covers |
+|---------------|--------|--------|
+| Linear projection | `conv(weight, x, pad="valid")` | Any learned linear layer |
+| MatMul | `matmul(A, B)` | Attention scores, similarity, any bilinear op |
+| Softmax | `softmax(x, dim)` | Attention weights, classification, any probability distribution |
+| Reduce | `reduce_sum`, `reduce_mean`, `reduce_max` | Any normalization, pooling, aggregation |
+| Element-wise unary | `sigmoid`, `tanh`, `exp`, `pow`, `sqrt`, `neg` | Any activation or normalization |
+| Element-wise binary | `add`, `mul`, `sub`, `div`, `max` | Residuals, gating, any element-wise combination |
+| Convolution (N-D) | `conv(weight, x, pad, stride, dilation)` | Spatial convolutions, 1D causal convs, patch embedding |
+| Concat / Split | `concat(tensors, dim)`, `split(x, sizes, dim)` | Skip connections, multi-head split, expert routing |
+| Reshape / Transpose | `reshape`, `transpose` | Layout transformations between ops |
+| Gather / Scatter | `gather(x, indices)` | Embedding lookup, expert selection |
 
-Ten primitives cover every architecture. The template just defines the order and connectivity.
+These 10 primitive categories cover **any** differentiable computation graph. If you can express your model as a DAG of these operations, it runs on ANE. The template's job is to compose them in the right order for a given architecture pattern.
 
 ---
 
@@ -459,9 +509,9 @@ POST /v1/training/step
 
 POST /v1/models
   → Upload model weights (multipart/form-data)
-  → Optional: architecture hint (auto-detected if omitted)
-  → Auto-detects format + architecture, selects template, compiles
-  → Output: { model_id, architecture, config, binary_hash }
+  → Optional: pattern + adapter hints (auto-detected if omitted)
+  → Plugin pipeline: format detect → adapter match → compile
+  → Output: { model_id, pattern, config, binary_hash }
 
 GET /v1/models
   → List available models with configs and pricing
@@ -473,10 +523,19 @@ GET /v1/health
   → { status, queue_depth, chip, ane_tops, models_loaded }
 
 GET /v1/capabilities
-  → { chip, memory, ane_tops, models, architectures, services, pricing }
+  → { chip, memory, ane_tops, models, patterns, formats, pricing }
 
-GET /v1/architectures
-  → List supported architecture families + template versions
+GET /v1/plugins
+  → List installed plugins: templates (with pattern + required_config),
+    adapters (with name + pattern), format readers (with name + extensions)
+
+POST /v1/plugins/templates
+  → Upload a new template plugin (tar.gz: manifest.yaml + .m.tmpl + deps/)
+  → Hot-reloads into registry without restart
+
+POST /v1/plugins/adapters
+  → Upload a new adapter plugin (.py file)
+  → Hot-reloads into registry without restart
 ```
 
 ### 5.2 x402 Integration
@@ -548,11 +607,12 @@ Every response includes a proof bundle — the evidence package that makes the r
   "job": {
     "job_id": "uuid",
     "model_id": "sha256:abc...",
+    "pattern": "decoder_rmsnorm_swiglu",
+    "template_version": 1,
     "binary_hash": "sha256:def...",
-    "input_hash": "keccak256(input_tokens)",
-    "output_hash": "keccak256(output_tokens)",
-    "seed": 42,
-    "temperature": 0.0,
+    "input_hash": "keccak256(canonical_input)",
+    "output_hash": "keccak256(canonical_output)",
+    "params_hash": "keccak256(canonical_params)",
     "timestamp": 1709510400
   },
 
@@ -648,9 +708,9 @@ For each completed job:
 
 For PoSP to work, the same input must produce the same output across nodes. We enforce this at multiple levels:
 
-**Level 1 — Same binary.** All providers for a given model compile from the same template source. Binary hash published in manifest. Validators reject binary hash mismatch.
+**Level 1 — Same binary.** All providers for a given model compile from the same template plugin + config. Binary hash published in manifest. Validators reject binary hash mismatch. Template version pinned in proof bundle.
 
-**Level 2 — Same MIL programs.** The MIL text is a deterministic function of (template_source, model_dimensions). Same dimensions → same MIL → same ANE program → same compute graph.
+**Level 2 — Same MIL programs.** The MIL text is a deterministic function of (template_source, config_values). Same config → same MIL → same ANE program → same compute graph. No runtime branching.
 
 **Level 3 — Same chip family.** Validators selected from same chip family (M4 validates M4). Within a family, ANE produces bit-identical fp16 results because:
 - Fixed dataflow (no thread scheduling variance)
@@ -693,11 +753,26 @@ Cheating is economically irrational by 4 orders of magnitude.
 ├── config.yaml                    # Provider configuration
 ├── keys/
 │   └── sep_key_ref.pem            # Reference to SEP key (not the key itself)
+├── plugins/
+│   ├── templates/                 # Template plugins (auto-discovered)
+│   │   ├── decoder_rmsnorm_swiglu/
+│   │   │   ├── manifest.yaml
+│   │   │   ├── inference.m.tmpl
+│   │   │   └── deps/
+│   │   ├── ... (any number of templates)
+│   ├── adapters/                  # Adapter plugins (auto-discovered)
+│   │   ├── hf_causal_lm.py
+│   │   ├── gguf_generic.py
+│   │   ├── ... (any number of adapters)
+│   └── formats/                   # Format reader plugins (auto-discovered)
+│       ├── safetensors.py
+│       ├── gguf.py
+│       ├── ... (any number of format readers)
 ├── models/
 │   ├── sha256_a1b2c3.../
-│   │   ├── weights.bin            # Original weights (read-only)
-│   │   ├── manifest.json          # Config, hashes, metadata
-│   │   ├── inference              # Compiled binary (model-specific)
+│   │   ├── weights.anew           # Normalized weights (ANEW format, read-only)
+│   │   ├── manifest.json          # Config, hashes, pattern, adapter used
+│   │   ├── inference              # Compiled binary
 │   │   └── tokenizer.bin          # Optional tokenizer
 │   └── sha256_d4e5f6.../
 │       └── ...
@@ -708,19 +783,21 @@ Cheating is economically irrational by 4 orders of magnitude.
 ### 8.2 Model Lifecycle
 
 ```
-Upload → Detect → Validate → Adapt → Template → Compile → Hash → Register → Serve
-  │        │         │         │         │          │        │        │         │
-  │     auto-ID   check     export    select     xcrun   sha256   on-chain   ready
-  │     arch +    dims +    weights   template   clang   binary   announce
-  │     format    size      to ANEW   by arch
+Upload → Format → Adapter → Validate → Export → Template → Compile → Hash → Serve
+  │        │        │          │         │         │          │        │       │
+  │     plugin   plugin     check     write     plugin     xcrun   sha256   ready
+  │     scan     score +    config    ANEW      subst +   clang   binary
+  │     detect   select     vs tmpl   blob      select
   │
   └─ reject if:
-     - no adapter recognizes the format
-     - architecture not in registry (unknown template)
-     - dims unsupported (e.g., dim > 16384)
-     - file too large (> 50 GB)
-     - weight tensor count doesn't match architecture expectations
-     - compilation fails (invalid dimensions for ANE)
+     - no format plugin can read the file
+     - no adapter claims the model (all confidence = 0.0)
+     - config fields don't satisfy template's required_config
+     - no template installed for the adapter's target pattern
+     - dims exceed provider resource limits
+     - file too large (configurable limit)
+     - tensor count / shapes don't match template's tensor_layout
+     - compilation fails (clang error on generated source)
 ```
 
 ### 8.3 Cache & Eviction
@@ -755,14 +832,22 @@ x402:
   chain: "eip155:8453"               # Base
   asset: "USDC"
 
+plugins:
+  templates_dir: "~/.ane_provider/plugins/templates"
+  adapters_dir: "~/.ane_provider/plugins/adapters"
+  formats_dir: "~/.ane_provider/plugins/formats"
+  hot_reload: true                   # Watch dirs for new plugins
+  allow_upload: true                 # Allow remote plugin upload via API
+
 models:
   store_path: "~/.ane_provider/models"
   max_disk_gb: 100
-  allowed_architectures: "all"       # Or list: ["llama", "gpt2", "bert", "t5", "mamba", "vit", "sd-unet"]
-  max_dim: 16384
-  max_layers: 128
-  max_vocab: 256000
-  max_experts: 16                    # For MoE models
+  max_upload_gb: 50                  # Single file upload limit
+  allowed_patterns: "all"            # Or list: ["decoder_rmsnorm_swiglu", "encoder_bidirectional"]
+  resource_limits:                   # Reject models that exceed these
+    max_params: 70_000_000_000       # 70B parameters
+    max_memory_gb: 32                # Estimated runtime memory
+    max_ane_kernels: 500             # Total ANE programs per model
 
 sandbox:
   timeout_inference_s: 60
@@ -786,6 +871,8 @@ logging:
 
 ### 10.1 Inference Request
 
+The input schema is determined by the model's template `output_type`. The gateway validates input against the template manifest before dispatching.
+
 ```
 POST /v1/inference HTTP/1.1
 Host: provider.example.com:8402
@@ -794,27 +881,39 @@ X-PAYMENT: <x402 payment payload>
 
 {
   "model_id": "sha256:a1b2c3...",
-  "tokens": [1, 4532, 817],
-  "max_tokens": 256,
-  "temperature": 0.0,
-  "seed": 42,
-  "top_p": 1.0,
+  "input": { ... },             ← Schema defined by template's output_type
+  "params": { ... },            ← Optional: temperature, seed, top_p, max_tokens, etc.
   "stream": false,
   "include_logits": false
 }
+```
+
+Example inputs by output type:
+
+```json
+// output_type: "token_sequence" (decoder models)
+{ "input": { "tokens": [1, 4532, 817] }, "params": { "max_tokens": 256, "temperature": 0.0, "seed": 42 } }
+
+// output_type: "classification" (encoder models)
+{ "input": { "tokens": [101, 2023, 2003, 1037, 3231, 102] } }
+
+// output_type: "embedding" (embedding models)
+{ "input": { "tokens": [1, 4532, 817] } }
+
+// output_type: "image" (diffusion models)
+{ "input": { "prompt_embedding": [...], "timesteps": 50, "guidance_scale": 7.5 } }
+
+// output_type: "seq2seq" (encoder-decoder models)
+{ "input": { "encoder_tokens": [1, 4532], "decoder_tokens": [1] }, "params": { "max_tokens": 128 } }
 ```
 
 ### 10.2 Inference Response
 
 ```json
 {
-  "tokens": [291, 1033, 445, 2],
-  "text": "Once upon a time...",
-  "finish_reason": "eos",
+  "output": { ... },            // Schema depends on output_type
+  "finish_reason": "eos",       // or "max_tokens", "stop_sequence"
   "usage": {
-    "prompt_tokens": 3,
-    "completion_tokens": 4,
-    "total_tokens": 7,
     "ane_time_ms": 12.4,
     "total_time_ms": 18.7
   },
@@ -829,25 +928,22 @@ X-PAYMENT: <x402 payment payload>
 
 ### 10.3 IPC with Sandbox Subprocess
 
-Gateway → subprocess communication via stdin/stdout:
+Gateway → subprocess communication via stdin/stdout. The protocol is the same regardless of model or template:
 
 ```
 Gateway writes to stdin:
 {
   "command": "inference",
-  "weights_path": "/path/to/weights.bin",
+  "weights_path": "/path/to/weights.anew",
   "tokenizer_path": "/path/to/tokenizer.bin",
-  "tokens": [1, 4532, 817],
-  "max_tokens": 256,
-  "temperature": 0.0,
-  "seed": 42,
-  "top_p": 1.0
+  "input": { ... },            ← Passed through from client
+  "params": { ... }            ← Passed through from client
 }
 <EOF>
 
 Subprocess writes to stdout:
 {
-  "tokens": [291, 1033, 445, 2],
+  "output": { ... },            ← Template-defined output
   "logits_hash": "abc...",
   "layer_checkpoints": {"6": "def..."},
   "ane_time_ms": 12.4
@@ -855,7 +951,7 @@ Subprocess writes to stdout:
 <EOF>
 ```
 
-The subprocess reads JSON from stdin, runs inference, writes JSON to stdout, exits. No persistent connection. No shared state.
+The subprocess reads JSON from stdin, runs inference, writes JSON to stdout, exits. No persistent connection. No shared state. The gateway never interprets the `input` or `output` fields — they are opaque payloads passed between client and compiled template binary.
 
 ---
 
@@ -869,67 +965,75 @@ eth_provider/
 ├── contracts/
 │   └── ANEMarketplace.sol           # On-chain: escrow, staking, PoSP, slashing
 │
-├── gateway/
-│   ├── server.py                    # Flask x402 server
-│   ├── x402.py                      # x402 payment verification
-│   ├── scheduler.py                 # Job queue + worker pool
-│   ├── proof.py                     # Proof bundle assembly
-│   └── posp.py                      # PoSP orchestrator client
+├── core/                            # Core system — model-agnostic, never references specific models
+│   ├── gateway/
+│   │   ├── server.py                # Flask x402 server
+│   │   ├── x402.py                  # x402 payment verification
+│   │   ├── scheduler.py             # Job queue + worker pool
+│   │   ├── proof.py                 # Proof bundle assembly
+│   │   └── posp.py                  # PoSP orchestrator client
+│   │
+│   ├── sandbox/
+│   │   ├── runner.py                # Subprocess exec with sandbox-exec
+│   │   ├── ane_sandbox.sb           # macOS sandbox profile
+│   │   └── limits.py                # Resource limit enforcement
+│   │
+│   ├── plugins/
+│   │   ├── loader.py                # Plugin auto-discovery (scan dirs, import modules)
+│   │   ├── base_template.py         # TemplatePlugin base + manifest parser
+│   │   ├── base_adapter.py          # AdapterPlugin base (can_handle, extract_config, export)
+│   │   ├── base_format.py           # FormatPlugin base (can_read, read_metadata, iter_tensors)
+│   │   └── compiler.py              # Template substitution + clang compilation
+│   │
+│   ├── store/
+│   │   ├── manager.py               # Model store (upload pipeline, eviction, lookup)
+│   │   └── anew.py                  # ANEW normalized weight format (read/write)
+│   │
+│   ├── attestation/
+│   │   ├── sep.py                   # Secure Enclave key management
+│   │   └── verify.py                # Attestation chain verification
+│   │
+│   ├── shared_headers/              # C headers included by all templates
+│   │   ├── ane_runtime.h            # ANE private API wrapper
+│   │   ├── ane_mil_gen.h            # MIL text generation helpers
+│   │   ├── proof_output.h           # Logits hashing, proof serialization
+│   │   ├── sep_sign.h               # Secure Enclave signing
+│   │   └── weight_io.h              # ANEW weight blob loading (mmap)
+│   │
+│   └── config.py                    # Config loading (YAML)
 │
-├── sandbox/
-│   ├── runner.py                    # Subprocess exec with sandbox-exec
-│   ├── ane_sandbox.sb               # macOS sandbox profile
-│   └── limits.py                    # Resource limit enforcement
+├── plugins/                         # All model-specific knowledge lives here
+│   ├── templates/                   # Template plugins (self-describing, auto-discovered)
+│   │   ├── decoder_rmsnorm_swiglu/  # Example: handles Llama-pattern models
+│   │   │   ├── manifest.yaml
+│   │   │   ├── inference.m.tmpl
+│   │   │   └── deps/
+│   │   │       └── rope.h
+│   │   ├── decoder_layernorm_gelu/  # Example: handles GPT-pattern models
+│   │   │   ├── manifest.yaml
+│   │   │   └── inference.m.tmpl
+│   │   ├── .../                     # Any number of templates — drop in to add support
+│   │   └── README.md                # How to write a template plugin
+│   │
+│   ├── adapters/                    # Adapter plugins (auto-discovered .py files)
+│   │   ├── hf_causal_lm.py         # Generic HuggingFace causal LM adapter
+│   │   ├── hf_seq2seq.py           # Generic HuggingFace seq2seq adapter
+│   │   ├── gguf_generic.py         # Generic GGUF model adapter
+│   │   ├── .../                     # Any number of adapters — drop in to add support
+│   │   └── README.md                # How to write an adapter plugin
+│   │
+│   └── formats/                     # Format reader plugins (auto-discovered .py files)
+│       ├── safetensors_reader.py
+│       ├── gguf_reader.py
+│       ├── onnx_reader.py
+│       ├── .../                     # Any number of format readers — drop in to add support
+│       └── README.md                # How to write a format plugin
 │
-├── models/
-│   ├── store.py                     # Model store management (upload, compile, evict)
-│   ├── registry.py                  # Architecture registry (arch → template + adapter)
-│   ├── adapters/
-│   │   ├── base.py                  # WeightAdapter base class
-│   │   ├── llama.py                 # Llama, Mistral, Phi, Gemma, Qwen adapters
-│   │   ├── gpt.py                   # GPT-2, GPT-NeoX, OPT, Pythia adapters
-│   │   ├── encoder.py              # BERT, RoBERTa adapters
-│   │   ├── encdec.py               # T5, BART, Flan-T5 adapters
-│   │   ├── moe.py                   # Mixtral, DBRX adapters
-│   │   ├── mamba.py                 # Mamba/SSM adapter
-│   │   ├── vision.py               # ViT, CLIP adapters
-│   │   └── diffusion.py            # Stable Diffusion UNet adapter
-│   ├── formats/
-│   │   ├── safetensors.py           # Safetensors reader
-│   │   ├── gguf.py                  # GGUF reader
-│   │   ├── llama2c.py               # llama2.c binary reader
-│   │   └── onnx.py                  # ONNX reader
-│   └── templates/
-│       ├── shared/
-│       │   ├── ane_runtime.h         # ANE private API wrapper
-│       │   ├── ane_mil_gen.h         # MIL text generation helpers
-│       │   ├── proof_output.h        # Logits hashing, proof serialization
-│       │   ├── sep_sign.h            # Secure Enclave signing
-│       │   └── weight_io.h           # Normalized weight blob loading
-│       ├── arch_headers/
-│       │   ├── rope.h                # RoPE position encoding (Llama, Mistral)
-│       │   ├── layernorm.h           # LayerNorm (GPT, BERT, T5, ViT)
-│       │   ├── moe_router.h          # Top-k expert gating (Mixtral, DBRX)
-│       │   ├── ssm.h                 # Selective state space ops (Mamba)
-│       │   └── unet.h                # UNet skip connections (Diffusion)
-│       ├── inference_llama.m.tmpl    # Decoder-only: RMSNorm + SwiGLU + RoPE
-│       ├── inference_gpt.m.tmpl      # Decoder-only: LayerNorm + GELU
-│       ├── inference_encoder.m.tmpl  # Encoder-only: bidirectional attention
-│       ├── inference_encdec.m.tmpl   # Encoder-decoder: cross-attention
-│       ├── inference_moe.m.tmpl      # Mixture of experts: routing + expert FFN
-│       ├── inference_mamba.m.tmpl    # State-space: selective scan
-│       ├── inference_vit.m.tmpl      # Vision transformer: patch embed + encoder
-│       ├── inference_clip.m.tmpl     # CLIP: dual encoder + contrastive
-│       └── inference_diffusion.m.tmpl # Diffusion UNet: downsample/upsample + cross-attn
-│
-├── attestation/
-│   ├── sep.py                       # Secure Enclave key management
-│   └── verify.py                    # Attestation chain verification
-│
-├── config.py                        # Config loading (YAML)
 ├── requirements.txt
 └── README.md                        # Quick start
 ```
+
+**Key structural property:** The `core/` directory has zero imports from `plugins/`. It only imports plugin base classes and the loader. All model-specific knowledge is in `plugins/` and discovered at runtime. You can delete every plugin and the core still starts — it just can't handle any models until you add plugins back.
 
 ---
 
@@ -937,56 +1041,60 @@ eth_provider/
 
 | Threat | Mitigation |
 |--------|-----------|
-| Malicious model weights (crafted to exploit buffer overflow) | Sandbox: deny network, deny process-exec, memory limit. Weight adapter validates tensor shapes against architecture schema before generating C code. Template compilation rejects invalid dims. |
-| Unknown architecture used to bypass adapter validation | Architecture tag must map to a registered template. Upload rejected if no adapter recognizes the format. `allowed_architectures` config can restrict to a whitelist. |
-| Model too large for device memory | Pre-check: `weight_bytes < available_memory * 0.8`. Reject at upload. Per-architecture memory estimator (weights + KV-cache + activations). |
+| Malicious model weights (crafted to exploit buffer overflow) | Sandbox: deny network, deny process-exec, memory limit. Adapter validates tensor shapes against template's `tensor_layout` before generating C code. Compilation rejects invalid dims. |
+| No plugin can handle uploaded model | Upload rejected with 422 (Unprocessable). Format readers, adapters, and templates all fail gracefully. No partial state left behind. |
+| Malicious plugin uploaded via API | Plugin upload requires provider auth. Plugins are Python (adapters/formats) and C (templates) — both reviewed before hot-reload if `allow_upload: true`. Disable via config. Templates are compiled in sandbox test before activation. |
+| Adapter returns crafted config to exploit template substitution | Config values are validated against template's `required_config` schema (type, range). Substitution is simple string replacement into `#define` constants — no eval, no format strings. Integer overflow checked pre-substitution. |
+| Model too large for device memory | Template manifest declares `resource_hints.memory_per_param_bytes`. Provider estimates total memory (params × bytes + KV-cache + activations) and rejects if exceeding `resource_limits.max_memory_gb`. |
 | Denial of service (flood requests) | Bounded queue (503 on overflow). x402 payment required (costs money to spam). Rate limit per wallet. |
 | Provider returns cached stale result | Freshness nonce in every request. SEP attestation includes timestamp. PoSP validators use same nonce. |
 | Provider runs weaker model (fewer layers) | Binary hash in attestation. Validators compile same template from same config, compare hash. |
-| Provider swaps architecture (claims Llama, runs GPT-2) | Architecture tag in manifest. Binary hash tied to specific template. Validators detect template mismatch. Logits dimensionality check (wrong arch = wrong output shape). |
-| Crafted adapter exploits compilation | Adapter runs in gateway (before sandbox) — dimension bounds checked: `0 < dim <= max_dim`, `0 < layers <= max_layers`. Generated C source is deterministic from config. No user-controlled strings in generated code. |
-| Sandbox escape | macOS sandbox-exec is kernel-enforced. ANE access is read-only (no code execution on ANE). Process exits after each job. Same profile for all architectures. |
+| Provider swaps template pattern | Binary hash is tied to specific template source + config. Validators use the same `(pattern, template_version, binary_hash)` triple. Mismatch = slash. |
+| Sandbox escape | macOS sandbox-exec is kernel-enforced. ANE access is read-only (no code execution on ANE). Process exits after each job. Same sandbox profile regardless of which template was compiled. |
 | Side-channel on model weights | Weights are read-only in sandbox. Network denied. No exfiltration path. |
 | Compromised gateway (not subprocess) | Gateway never touches model weights or ANE. It only routes JSON. Attestation is signed by subprocess via SEP. |
-| Cross-architecture PoSP mismatch | Validators must use same `(architecture, template_version, binary_hash)`. Different architectures naturally produce different binary hashes, preventing cross-architecture validation. |
+| Cross-pattern PoSP mismatch | Validators must use same `(pattern, template_version, binary_hash)`. Different patterns naturally produce different binary hashes, preventing cross-pattern validation. |
+| Rogue hot-reloaded plugin | Hot-reload only activates after: (1) plugin passes schema validation, (2) test compilation succeeds (templates), (3) test import succeeds (adapters/formats). Existing active jobs are not affected — they use the already-compiled binary. |
 
 ---
 
 ## 13. Implementation Sequence
 
 ```
-Week 1: Core plumbing (Llama template as first architecture)
-  ├── Shared headers: weight_io.h, proof_output.h, sep_sign.h
-  ├── inference_llama.m.tmpl (parameterized Llama inference template)
-  ├── LlamaAdapter + safetensors reader
-  ├── registry.py (architecture → template mapping)
-  ├── store.py (model upload, auto-detect, adapt, compile, cache)
-  ├── runner.py (subprocess exec with IPC)
-  └── Verify: upload Llama model → compile → run inference → get output
+Week 1: Plugin system + core pipeline
+  ├── Plugin base classes: TemplatePlugin, AdapterPlugin, FormatPlugin
+  ├── PluginLoader: directory scan, import, validation
+  ├── Shared C headers: ane_runtime.h, ane_mil_gen.h, weight_io.h, proof_output.h
+  ├── ANEW format: anew.py (read/write normalized weight blobs)
+  ├── Compiler: template substitution + clang invocation
+  ├── Store: upload pipeline (format → adapter → compile → cache)
+  ├── Runner: subprocess exec with IPC (stdin JSON → stdout JSON)
+  ├── First template plugin (decoder_rmsnorm_swiglu) as proof of concept
+  ├── First adapter plugin (hf_causal_lm) + first format plugin (safetensors)
+  └── Verify: upload any HF causal LM → auto-detect → compile → inference → output
 
-Week 2: Multi-architecture + proof
-  ├── inference_gpt.m.tmpl (GPT-2/NeoX template, layernorm.h)
-  ├── inference_encoder.m.tmpl (BERT template)
-  ├── GPT2Adapter, BERTAdapter, GGUF format reader
-  ├── Add logits_hash + layer_checkpoints to all template outputs
-  ├── sep.py (SEP key gen + signing via Security.framework)
-  ├── proof.py (assemble proof bundle)
-  └── Verify: upload GPT-2 and BERT models, get valid proofs from both
+Week 2: Proof + attestation + second template
+  ├── proof_output.h: logits_hash + layer_checkpoints in compiled binary output
+  ├── sep.py: SEP key gen + signing via Security.framework
+  ├── proof.py: assemble proof bundle from subprocess output
+  ├── Second template plugin (decoder_layernorm_gelu) to prove the pattern is generic
+  ├── Second format plugin (gguf) to prove format plugins are independent
+  ├── Plugin hot-reload: watch dirs, validate, activate without restart
+  └── Verify: two different model architectures, both produce valid SEP-signed proofs
 
-Week 3: Remaining architectures + x402 + server
-  ├── inference_encdec.m.tmpl (T5/BART)
-  ├── inference_moe.m.tmpl (Mixtral — moe_router.h)
-  ├── inference_vit.m.tmpl, inference_diffusion.m.tmpl
-  ├── Remaining adapters (T5, Mixtral, ViT, SD)
-  ├── server.py (Flask endpoints)
-  ├── x402.py (payment verification via Coinbase facilitator)
-  ├── scheduler.py (queue + workers)
-  └── Verify: end-to-end paid inference across 3+ architectures
+Week 3: x402 + server + plugin API
+  ├── server.py: Flask endpoints (inference, training, models, plugins, health)
+  ├── x402.py: payment verification via Coinbase facilitator
+  ├── scheduler.py: job queue + worker pool
+  ├── Plugin upload endpoints: POST /v1/plugins/templates, /v1/plugins/adapters
+  ├── Third template plugin (encoder_bidirectional) — contributed via API upload
+  └── Verify: end-to-end paid inference, hot-add a new template via API, serve a new model
 
 Week 4: PoSP + on-chain
   ├── ANEMarketplace.sol (deploy to Base testnet)
   ├── posp.py (commit results, handle challenges)
-  ├── Validator mode (re-run jobs on challenge, architecture-aware matching)
-  ├── inference_mamba.m.tmpl (Mamba SSM — last architecture)
+  ├── Validator mode (re-run jobs on challenge, pattern-aware matching)
+  ├── Plugin README docs (how to write a template, adapter, format reader)
   └── Verify: full loop — pay, compute, prove, challenge, settle
+         with models using different templates to prove pattern-agnostic verification
 ```
