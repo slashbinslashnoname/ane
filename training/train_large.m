@@ -1,5 +1,5 @@
 // train_large.m — Train stories110M (12 layers, 768dim, 3072hidden) on ANE
-// Uses pretokenized TinyStories data with cross-entropy loss
+// Uses pretokenized wiki_text data with cross-entropy loss
 // 5 weight-bearing ANE kernels per layer × 12 layers = 60 per compile batch
 #include "stories_io.h"
 #include "stories_mil.h"
@@ -7,7 +7,7 @@
 
 #define CKPT_PATH "ane_stories110M_ckpt.bin"
 #define MODEL_PATH "../../assets/models/stories110M.bin"
-#define DATA_PATH "tinystories_data00.bin"
+#define DATA_PATH "train_data00.bin"
 
 // ===== Weight loading from llama2.c format =====
 static bool load_pretrained(LayerWeights *lw, float *rms_final, float *embed, const char *path) {

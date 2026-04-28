@@ -36,7 +36,7 @@ Per-step timing breakdown on M4:
 | `stories_mil.h` | MIL program generators for all 6 ANE kernel types |
 | `stories_cpu_ops.h` | vDSP-vectorized RMSNorm, cross-entropy loss, Adam optimizer, embedding ops |
 | `dashboard.py` | TUI dashboard — loss curves, power/CPU/memory graphs, live text generation |
-| `tokenize.py` | Extract pretokenized TinyStories data from zip |
+| `prepare_data.py` | Fetch tokenizer + stream wiki_text from HuggingFace, tokenize to uint16 .bin |
 | `test_dashboard.py` | Python unit tests for dashboard functions (59 tests) |
 | `test_*.m` | ANE kernel tests and hardware probes (10 files) |
 | `Makefile` | Build targets for training and probes |
@@ -49,13 +49,13 @@ Per-step timing breakdown on M4:
 
 3. **Compile budget**: ANE has a ~119 compile limit per process. With 72 kernels per batch, we run 10 accumulation steps then `exec()` restart with checkpoint resume.
 
-4. **Data**: Real TinyStories text (20M tokens), mmap'd uint16 token IDs, random position sampling per step.
+4. **Data**: `yoandrey/wiki_text` streamed from HuggingFace and tokenized to flat uint16 token IDs (default cap 50M), mmap'd with random position sampling per step.
 
 ## Usage
 
 ```bash
-# 1. Extract tokenized data (needs ~/tiny_stories_data_pretokenized.zip)
-python3 tokenize.py
+# 1. Fetch tokenizer + tokenize wiki_text (writes train_data00.bin)
+python3 prepare_data.py
 
 # 2. Build and train
 make train_large
